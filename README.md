@@ -29,27 +29,22 @@
 - Windows 10 2004（版本 19041）或更高版本、Windows 11（需要 `pnputil /enable-device`）
 - .NET Framework 4.7.2 或更高（Windows 10 1803 起已内置）
 
-### 构建
+### 安装
 
-```powershell
-.\build.ps1
-```
+1. 从 [Releases](https://github.com/willlllliams/TouchToggle/releases/latest) 下载 `TouchToggle-Setup-<版本>.exe`，双击运行，同意 UAC。
+2. 按向导操作：选择语言（简体中文 / English），同意许可协议，选择是否**开机自启动**、是否**创建桌面快捷方式**。
+3. 安装程序会把程序装到 `C:\Program Files\TouchToggle\`，在开始菜单创建快捷方式，并注册后台助手。安装完成后可以直接启动。
 
-生成 `TouchToggle.exe`。也可以直接执行：
+安装位置固定为 `Program Files`，不能修改。原因是后台助手以 SYSTEM 身份运行安装目录里的程序，这个目录必须只有管理员能写，否则其他程序可以替换它来获取最高权限。
 
-```powershell
-& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /codepage:65001 /optimize+ /win32manifest:app.manifest /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll /out:TouchToggle.exe TouchToggle.cs
-```
+**升级**：直接运行新版安装程序即可。它会自动关闭正在运行的旧版本，并保留你的设置。
 
 ### 使用
 
-1. 双击 `TouchToggle.exe`，任务栏右下角出现图标。
+1. 安装后，任务栏右下角会出现图标。
 2. **左键**点击图标打开面板；**右键**有“打开面板 / 退出”。
-3. 第一次使用时，面板顶部会提示安装**后台助手**。点击“立即安装”并在 UAC 中确认。程序会被复制到 `C:\Program Files\TouchToggle\` 并从那里继续运行。
-4. 之后直接点击开关即可，不会再弹出管理员提示。
-5. 在“设置”中可以开启**开机自启动**，或**卸载**后台助手。
-
-**升级**：先在托盘图标右键菜单中点“退出”，关闭旧版本，再运行新的 `TouchToggle.exe`。面板会提示“后台助手需要更新”，点“立即更新”并同意一次 UAC 即可。
+3. 直接点击开关或拖动亮度滑块即可，不会弹出管理员提示。
+4. 在“设置”中可以开启或关闭**开机自启动**。
 
 > ⚠️ 关闭笔记本自带的触摸板后，只能用触摸屏或外接鼠标操作，请注意。
 
@@ -80,20 +75,50 @@
 - 后台助手对请求目录只读：不写、不删、跳过符号链接，并忽略两分钟前的旧请求。
 - 调用系统程序时一律使用 `System32` 下的完整路径。
 
+### 卸载
+
+和其他软件一样，用下面任一方式卸载：
+
+- **设置 → 应用 → 应用和功能**，找到 TouchToggle，点“卸载”
+- **控制面板 → 程序和功能**
+- 面板“设置”中，后台助手旁的**卸载程序**
+
+卸载程序会关闭托盘程序，并删除以下内容，不留残余：
+- 程序文件和开始菜单、桌面快捷方式
+- 后台助手的计划任务
+- `%ProgramData%\TouchToggle`
+- 开机启动项
+- 程序设置
+
+### 从源码构建
+
+需要 Windows 自带的 .NET Framework 编译器。打包安装程序还需要 [Inno Setup 6](https://jrsoftware.org/isinfo.php)，可以用 `winget install JRSoftware.InnoSetup` 安装。
+
+```powershell
+.\build.ps1                         # 只编译 TouchToggle.exe
+.\installer\build-installer.ps1     # 编译并打包安装程序，输出到 dist\
+```
+
+| 文件 | 说明 |
+|---|---|
+| `TouchToggle.cs` | 全部源码 |
+| `app.manifest` | 普通权限运行、高 DPI 感知 |
+| `installer\TouchToggle.iss` | Inno Setup 安装脚本 |
+| `installer\make-icon.ps1` | 生成程序图标和安装向导图片 |
+| `installer\ChineseSimplified.isl` | Inno Setup 简体中文翻译（来自 [Inno Setup 官方仓库](https://github.com/jrsoftware/issrc/tree/main/Files/Languages/Unofficial)） |
+
+不想安装也可以直接运行编译出来的 `TouchToggle.exe`。第一次打开面板时点“立即安装”，就会注册后台助手，这时不会出现在“应用和功能”里。
+
 ### 命令行参数
 
 | 参数 | 说明 |
 |---|---|
 | （无） | 启动托盘程序 |
-| `--install <域\用户>` | 安装后台助手（需管理员，面板会自动调用） |
-| `--uninstall` | 卸载后台助手（需管理员） |
+| `--install [域\用户]` | 注册后台助手（需管理员）。不指定用户时，使用当前登录的用户 |
+| `--uninstall [--keep-files]` | 删除后台助手（需管理员）。加 `--keep-files` 时不删除程序文件，供卸载程序使用 |
+| `--autostart on\|off` | 开启或关闭当前用户的开机自启动 |
 | `--helper` | 后台助手模式，由计划任务调用 |
 | `--snapshot <out.png> [dark\|light] [缩放]` | 把面板渲染成图片，用于截图或调试 |
-
-### 卸载
-
-1. 在面板“设置”中点击后台助手旁的**卸载**，确认 UAC。会删除计划任务和 `C:\Program Files\TouchToggle\`。
-2. 如果开启过开机自启动，可以先在面板中关闭它；或者删除注册表值 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\TouchToggle`。
 
 ---
 
@@ -120,27 +145,22 @@ A small Windows tray utility that lets you **turn individual touchscreens, pens 
 - Windows 10 2004 (build 19041) or later, or Windows 11 (for `pnputil /enable-device`)
 - .NET Framework 4.7.2 or later (built in since Windows 10 1803)
 
-### Build
+### Install
 
-```powershell
-.\build.ps1
-```
+1. Download `TouchToggle-Setup-<version>.exe` from [Releases](https://github.com/willlllliams/TouchToggle/releases/latest), run it, and approve UAC.
+2. Follow the wizard: pick a language (简体中文 / English), accept the license, and choose whether to **start with Windows** and whether to **create a desktop shortcut**.
+3. The installer puts the app in `C:\Program Files\TouchToggle\`, adds a Start menu shortcut and registers the background helper. You can launch it right from the last page.
 
-This produces `TouchToggle.exe`. Or run the compiler directly:
+The install location is fixed to `Program Files`. The helper runs the installed exe as SYSTEM, so its folder must be writable by admins only. Otherwise another program could swap the exe and gain full privileges.
 
-```powershell
-& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /codepage:65001 /optimize+ /win32manifest:app.manifest /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll /out:TouchToggle.exe TouchToggle.cs
-```
+**Upgrading**: just run the new installer. It closes the running version for you and keeps your settings.
 
 ### Usage
 
-1. Run `TouchToggle.exe`. An icon appears in the notification area.
+1. After installing, an icon appears in the notification area.
 2. **Left-click** the icon to open the panel. **Right-click** gives "Open panel / Exit".
-3. On first use, the panel asks you to install the **background helper**. Click the install button and approve UAC. The app copies itself to `C:\Program Files\TouchToggle\` and keeps running from there.
-4. From then on, just flip the switches. There are no more admin prompts.
-5. Under Settings you can turn on **start with Windows** or **uninstall** the helper.
-
-**Upgrading**: first quit the old version (right-click the tray icon, then "退出"), then run the new `TouchToggle.exe`. The panel will say the helper needs updating. Click the update button and approve UAC once.
+3. Flip the switches or drag the brightness sliders. There are no admin prompts.
+4. Under Settings you can turn **start with Windows** on or off.
 
 > ⚠️ If you disable the laptop's built-in touchpad, you'll need the touchscreen or an external mouse to get around.
 
@@ -173,20 +193,50 @@ While you drag a brightness slider, only the latest value is written, so a burst
 - The helper treats the queue as read-only: it never writes or deletes there, skips symlinks, and ignores requests older than two minutes.
 - System tools are always launched by their full `System32` path.
 
+### Uninstall
+
+Uninstall it like any other app, using any of these:
+
+- **Settings → Apps → Apps & features**, find TouchToggle, then Uninstall
+- **Control Panel → Programs and Features**
+- The **uninstall** button next to the helper under Settings in the panel
+
+The uninstaller closes the tray app and removes everything, leaving nothing behind:
+- The program files and Start menu / desktop shortcuts
+- The helper's scheduled task
+- `%ProgramData%\TouchToggle`
+- The start-with-Windows entry
+- The app's settings
+
+### Build from source
+
+You need the .NET Framework compiler that ships with Windows. To package the installer you also need [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`).
+
+```powershell
+.\build.ps1                         # build TouchToggle.exe only
+.\installer\build-installer.ps1     # build and package the installer into dist\
+```
+
+| File | Purpose |
+|---|---|
+| `TouchToggle.cs` | All of the source code |
+| `app.manifest` | Runs unelevated, high-DPI aware |
+| `installer\TouchToggle.iss` | Inno Setup script |
+| `installer\make-icon.ps1` | Generates the app icon and wizard images |
+| `installer\ChineseSimplified.isl` | Inno Setup Simplified Chinese translation (from the [official Inno Setup repo](https://github.com/jrsoftware/issrc/tree/main/Files/Languages/Unofficial)) |
+
+You can also run the built `TouchToggle.exe` directly without installing. The first time you open the panel, click the install button to register the helper. Installed this way, it won't appear in Apps & features.
+
 ### Command-line options
 
 | Option | Description |
 |---|---|
 | (none) | Start the tray app |
-| `--install <DOMAIN\user>` | Install the helper (admin; the panel calls this for you) |
-| `--uninstall` | Remove the helper (admin) |
+| `--install [DOMAIN\user]` | Register the helper (admin). Without a user, the signed-in user is used |
+| `--uninstall [--keep-files]` | Remove the helper (admin). `--keep-files` leaves the program files in place; the uninstaller uses this |
+| `--autostart on\|off` | Turn start-with-Windows on or off for the current user |
 | `--helper` | Helper mode, invoked by the scheduled task |
 | `--snapshot <out.png> [dark\|light] [scale]` | Render the panel to an image, for screenshots or debugging |
-
-### Uninstall
-
-1. In the panel, click **Uninstall** next to the helper under Settings and approve UAC. This removes the scheduled task and `C:\Program Files\TouchToggle\`.
-2. If you turned on start with Windows, switch it off in the panel first, or delete the registry value `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\TouchToggle`.
 
 ---
 

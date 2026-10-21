@@ -9,6 +9,7 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Management;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.AccessControl;
@@ -17,6 +18,15 @@ using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
+
+[assembly: AssemblyTitle("TouchToggle")]
+[assembly: AssemblyDescription("触摸设备开关与屏幕亮度托盘工具")]
+[assembly: AssemblyProduct("TouchToggle")]
+[assembly: AssemblyCompany("willlllliams")]
+[assembly: AssemblyCopyright("Copyright © 2026 TouchToggle contributors · MIT License")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyInformationalVersion("1.2.0")]
 
 namespace TouchToggle
 {
@@ -257,6 +267,40 @@ namespace TouchToggle
 
         public static bool RunningInstalled { get { return SamePath(Application.ExecutablePath, InstalledExe); } }
 
+        // 用安装程序（Inno Setup）安装时生成的卸载程序；用面板安装时为 null
+        public static string SetupUninstaller
+        {
+            get
+            {
+                string p = Path.Combine(InstallDir, "unins000.exe");
+                return File.Exists(p) ? p : null;
+            }
+        }
+
+        [DllImport("wtsapi32.dll", CharSet = CharSet.Unicode)]
+        static extern bool WTSQuerySessionInformation(IntPtr server, int sessionId, int infoClass, out IntPtr buffer, out int bytes);
+        [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr p);
+
+        static string SessionInfo(int sessionId, int infoClass)
+        {
+            IntPtr buf;
+            int bytes;
+            if (!WTSQuerySessionInformation(IntPtr.Zero, sessionId, infoClass, out buf, out bytes)) return null;
+            try { return Marshal.PtrToStringUni(buf); }
+            finally { WTSFreeMemory(buf); }
+        }
+
+        // 当前会话里登录的用户（域\用户名）。UAC 用另一个管理员账户授权时，进程身份是那个管理员，
+        // 但应当把权限授予实际坐在电脑前的用户
+        public static string SessionUser()
+        {
+            int session = Process.GetCurrentProcess().SessionId;
+            string user = SessionInfo(session, 5);     // WTSUserName
+            string domain = SessionInfo(session, 7);   // WTSDomainName
+            if (string.IsNullOrEmpty(user)) return Environment.UserDomainName + "\\" + Environment.UserName;
+            return string.IsNullOrEmpty(domain) ? user : domain + "\\" + user;
+        }
+
         public static bool IsInstalled()
         {
             string o;
@@ -464,12 +508,14 @@ namespace TouchToggle
             Directory.CreateDirectory(QueueDir, queue);
         }
 
-        public static int DoUninstall()
+        // keepFiles：由安装程序的卸载程序调用时为 true，程序文件交给它删除
+        public static int DoUninstall(bool keepFiles)
         {
             string o;
             Shell.Run(Shell.Sys("schtasks.exe"), "/delete /tn " + TaskName + " /f", out o);
             Shell.Run(Shell.Sys("schtasks.exe"), "/delete /tn " + LegacyTaskName + " /f", out o);
             try { if (Directory.Exists(DataDir)) Directory.Delete(DataDir, true); } catch (Exception) { }
+            if (keepFiles) return 0;
             // 等托盘程序退出后再删除安装目录
             var psi = new ProcessStartInfo(Shell.Sys("cmd.exe"),
                 "/c ping -n 4 127.0.0.1 >nul & rmdir /s /q \"" + InstallDir + "\"")
@@ -1267,6 +1313,15 @@ namespace TouchToggle
         void Uninstall()
         {
             if (installing) return;
+            // 用安装程序安装的：交给正式的卸载程序（它会自己请求管理员权限并关闭本程序）
+            string uninstaller = Helper.SetupUninstaller;
+            if (uninstaller != null)
+            {
+                HideFlyout();
+                try { Process.Start(new ProcessStartInfo(uninstaller) { UseShellExecute = true }); }
+                catch (Exception) { error = "无法启动卸载程序"; }
+                return;
+            }
             installing = true;
             string err = "卸载失败";
             Background(() => err = Helper.Uninstall(), () =>
@@ -1440,12 +1495,16 @@ namespace TouchToggle
                 helper.NoToggle = true;
                 Settle(helper);
                 helper.Title = "后台助手";
-                helper.Detail = needsUpdate ? "需要更新" : "已安装 · 无需管理员";
+                bool viaSetup = Helper.SetupUninstaller != null;
+                helper.Detail = needsUpdate ? "需要更新" : "已安装 · v" + Application.ProductVersion;
                 helper.Glyph = GlyphShield;
                 helper.Last = true;
                 helper.R = new RectangleF(setCard.X, y + rowH, setCard.Width, rowH);
                 drawRows.Add(helper);
-                uninstallBtn.R = new RectangleF(setCard.Right - S(12) - S(56), helper.R.Y + (rowH - S(30)) / 2, S(56), S(30));
+                // 用安装程序安装的，卸载的是整个程序
+                uninstallBtn.Text = viaSetup ? "卸载程序" : "卸载";
+                float ub = viaSetup ? S(84) : S(56);
+                uninstallBtn.R = new RectangleF(setCard.Right - S(12) - ub, helper.R.Y + (rowH - S(30)) / 2, ub, S(30));
                 clickables.Add(uninstallBtn);
             }
             y += setCard.Height + S(18);
@@ -2048,8 +2107,10 @@ namespace TouchToggle
         {
             string mode = args.Length > 0 ? args[0] : "";
             if (mode == "--helper") return Helper.Serve();
-            if (mode == "--install") return args.Length > 1 ? Helper.DoInstall(args[1]) : 1;
-            if (mode == "--uninstall") return Helper.DoUninstall();
+            if (mode == "--install") return Helper.DoInstall(args.Length > 1 ? args[1] : Helper.SessionUser());
+            if (mode == "--uninstall") return Helper.DoUninstall(Array.IndexOf(args, "--keep-files") >= 0);
+            // 安装程序以当前用户身份调用，设置开机自启动
+            if (mode == "--autostart") return AutoStart.Set(args.Length > 1 && args[1] == "on") == null ? 0 : 1;
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);

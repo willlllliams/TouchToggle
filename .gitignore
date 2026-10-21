@@ -1,3 +1,5 @@
 *.exe
 *.pdb
 *.old
+dist/
+installer/icon-preview.png
