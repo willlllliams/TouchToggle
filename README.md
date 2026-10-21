@@ -8,10 +8,14 @@
 
 ## 中文
 
-一个常驻 Windows 托盘的小工具，可以**逐个开启或关闭**电脑上的触摸屏、手写笔和触摸板。特别适合双屏笔记本（如 ASUS ZenBook Duo），可以只关掉某一块屏幕的触摸。
+一个常驻 Windows 托盘的小工具，可以**逐个开启或关闭**电脑上的触摸屏、手写笔和触摸板，还能**调节每块屏幕的亮度**。特别适合双屏笔记本（如 ASUS ZenBook Duo），可以只关掉某一块屏幕的触摸。
 
 ### 功能
 
+- **屏幕亮度**（参考 [Monitorian](https://github.com/emoacht/Monitorian)）：每块屏幕一个滑块，可以拖动，也可以在滑块上滚动鼠标滚轮（每格 2%）。打开“联动”后，调一块屏幕，其他屏幕会按相同幅度一起变化。
+  - 笔记本内置屏：Windows 系统亮度接口（WMI）
+  - 外接显示器：DDC/CI（需要显示器支持并在显示器菜单中开启）
+  - 华硕 ScreenPad 副屏：华硕 ATK 接口，由后台助手代为调节
 - **按设备开关**：触摸屏、手写笔、触摸板分组显示，每个设备一个开关；同类有多个时可一键“全部开启 / 全部关闭”。
 - **自动识别屏幕**：根据 Windows“平板电脑设置”中的校准信息，标出每个触摸设备对应**主屏幕**还是**副屏幕**及其分辨率。
 - **精致的面板**：仿 Windows 快速设置的弹出面板，跟随系统深色 / 浅色模式与强调色，开关带动画，支持高 DPI。
@@ -45,6 +49,8 @@
 4. 之后直接点击开关即可，不会再弹出管理员提示。
 5. 在“设置”中可以开启**开机自启动**，或**卸载**后台助手。
 
+**升级**：先在托盘图标右键菜单中点“退出”，关闭旧版本，再运行新的 `TouchToggle.exe`。面板会提示“后台助手需要更新”，点“立即更新”并同意一次 UAC 即可。
+
 > ⚠️ 关闭笔记本自带的触摸板后，只能用触摸屏或外接鼠标操作，请注意。
 
 ### 工作原理
@@ -53,12 +59,16 @@
 
 | 部分 | 权限 | 作用 |
 |---|---|---|
-| 托盘程序 | 普通用户 | 显示面板，通过 WMI 读取设备状态 |
-| 后台助手（计划任务 `TouchToggle-Helper`） | SYSTEM | 调用 `pnputil /enable-device`、`/disable-device` |
+| 托盘程序 | 普通用户 | 显示面板，通过 WMI 读取设备状态；直接调节内置屏（WMI）和外接显示器（DDC/CI）的亮度 |
+| 后台助手（计划任务 `TouchToggle-Helper`） | SYSTEM | 调用 `pnputil /enable-device`、`/disable-device`；读写 ScreenPad 背光（华硕 ATK WMI 需要管理员） |
 
 1. 托盘程序把请求写到 `%ProgramData%\TouchToggle\queue\*.req`，然后运行 `schtasks /run /tn TouchToggle-Helper`。
-2. 计划任务以 SYSTEM 身份启动 `C:\Program Files\TouchToggle\TouchToggle.exe --helper`，读取请求并执行开关。
-3. 托盘程序轮询设备状态，确认生效后删除请求文件。
+2. 计划任务以 SYSTEM 身份启动 `C:\Program Files\TouchToggle\TouchToggle.exe --helper`，读取请求并执行。完成后把 ScreenPad 亮度写到 `%ProgramData%\TouchToggle\state.txt`，这个目录只有管理员可写。
+3. 托盘程序轮询设备状态或 `state.txt`，确认生效后删除请求文件。
+
+请求文件每行一条：`1 <设备ID>` 启用，`0 <设备ID>` 禁用，`B <20-255>` 设置 ScreenPad 背光，`Q` 只查询。
+
+拖动亮度滑块时，后台只写入最新的值，不会因为请求太多而卡顿。
 
 **安全措施**
 
@@ -89,10 +99,14 @@
 
 ## English
 
-A small Windows tray utility that lets you **turn individual touchscreens, pens and touchpads on or off**. It's especially handy on dual-screen laptops (e.g. ASUS ZenBook Duo), where you may want touch disabled on just one screen.
+A small Windows tray utility that lets you **turn individual touchscreens, pens and touchpads on or off** and **adjust the brightness of each screen**. It's especially handy on dual-screen laptops (e.g. ASUS ZenBook Duo), where you may want touch disabled on just one screen.
 
 ### Features
 
+- **Screen brightness** (inspired by [Monitorian](https://github.com/emoacht/Monitorian)): one slider per screen. Drag it, or scroll the mouse wheel over it (2% per notch). Turn on "联动" (link) to move all screens together by the same amount.
+  - Built-in laptop panel: Windows brightness API (WMI)
+  - External monitors: DDC/CI (the monitor must support it, with DDC/CI enabled in its menu)
+  - ASUS ScreenPad: ASUS ATK interface, applied by the background helper
 - **Per-device switches**: touchscreens, pens and touchpads are grouped, each with its own switch, plus "turn all on / off" for groups with more than one device.
 - **Knows which screen is which**: uses the calibration data from Windows "Tablet PC Settings" to label each touch device as the **primary** or **secondary** screen, with its resolution.
 - **Polished flyout**: modeled on Windows Quick Settings. It follows the system dark/light mode and accent color, has animated switches and supports high DPI.
@@ -126,6 +140,8 @@ This produces `TouchToggle.exe`. Or run the compiler directly:
 4. From then on, just flip the switches. There are no more admin prompts.
 5. Under Settings you can turn on **start with Windows** or **uninstall** the helper.
 
+**Upgrading**: first quit the old version (right-click the tray icon, then "退出"), then run the new `TouchToggle.exe`. The panel will say the helper needs updating. Click the update button and approve UAC once.
+
 > ⚠️ If you disable the laptop's built-in touchpad, you'll need the touchscreen or an external mouse to get around.
 
 The UI is currently in Chinese.
@@ -136,12 +152,16 @@ Changing a device's enabled state requires admin rights in Windows, so the app i
 
 | Part | Privilege | Role |
 |---|---|---|
-| Tray app | Standard user | Shows the panel and reads device state via WMI |
-| Helper (scheduled task `TouchToggle-Helper`) | SYSTEM | Runs `pnputil /enable-device` and `/disable-device` |
+| Tray app | Standard user | Shows the panel and reads device state via WMI. Sets built-in panel (WMI) and external monitor (DDC/CI) brightness directly |
+| Helper (scheduled task `TouchToggle-Helper`) | SYSTEM | Runs `pnputil /enable-device` and `/disable-device`. Reads and sets ScreenPad backlight (ASUS ATK WMI requires admin) |
 
 1. The tray app writes a request to `%ProgramData%\TouchToggle\queue\*.req`, then runs `schtasks /run /tn TouchToggle-Helper`.
-2. The task starts `C:\Program Files\TouchToggle\TouchToggle.exe --helper` as SYSTEM. The helper reads each request and applies it.
-3. The tray app polls device state until the change takes effect, then deletes its request.
+2. The task starts `C:\Program Files\TouchToggle\TouchToggle.exe --helper` as SYSTEM, and the helper applies each request. It then writes the ScreenPad level to `%ProgramData%\TouchToggle\state.txt`, in a folder only admins can write to.
+3. The tray app polls device state or `state.txt` until the change takes effect, then deletes its request.
+
+Each line of a request file is one command: `1 <device ID>` enables, `0 <device ID>` disables, `B <20-255>` sets the ScreenPad backlight, and `Q` only queries it.
+
+While you drag a brightness slider, only the latest value is written, so a burst of requests never queues up.
 
 **Safeguards**
 

@@ -113,25 +113,31 @@ namespace TouchToggle
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         static extern bool EnumDisplayDevices(string device, uint index, ref DISPLAY_DEVICE dd, uint flags);
 
+        // 屏幕（\\.\DISPLAY1）上的显示器接口路径，如 \\?\DISPLAY#AUOA48F#4&33fd3a7c&0&UID8388688#{guid}
+        public static List<string> MonitorPaths(string screenDeviceName)
+        {
+            var paths = new List<string>();
+            var dd = new DISPLAY_DEVICE();
+            dd.cb = Marshal.SizeOf(dd);
+            for (uint i = 0; EnumDisplayDevices(screenDeviceName, i, ref dd, 1); i++)   // 1 = EDD_GET_DEVICE_INTERFACE_NAME
+            {
+                if (!string.IsNullOrEmpty(dd.DeviceID)) paths.Add(dd.DeviceID);
+                dd.cb = Marshal.SizeOf(dd);
+            }
+            return paths;
+        }
+
         // 触摸设备实例 ID → { "主屏幕"/"副屏幕", "1920×1080" }，依据“平板电脑设置”里的屏幕校准映射
         static Dictionary<string, string[]> TouchToScreen()
         {
             var monitors = new Dictionary<string, string[]>();
             foreach (Screen sc in Screen.AllScreens)
-            {
-                var dd = new DISPLAY_DEVICE();
-                dd.cb = Marshal.SizeOf(dd);
-                for (uint i = 0; EnumDisplayDevices(sc.DeviceName, i, ref dd, 1); i++)   // 1 = EDD_GET_DEVICE_INTERFACE_NAME
-                {
-                    if (!string.IsNullOrEmpty(dd.DeviceID))
-                        monitors[dd.DeviceID.ToUpperInvariant()] = new[]
-                        {
-                            sc.Primary ? "主屏幕" : "副屏幕",
-                            sc.Bounds.Width + "×" + sc.Bounds.Height,
-                        };
-                    dd.cb = Marshal.SizeOf(dd);
-                }
-            }
+                foreach (string path in MonitorPaths(sc.DeviceName))
+                    monitors[path.ToUpperInvariant()] = new[]
+                    {
+                        sc.Primary ? "主屏幕" : "副屏幕",
+                        sc.Bounds.Width + "×" + sc.Bounds.Height,
+                    };
 
             var result = new Dictionary<string, string[]>();
             using (var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Wisp\Pen\Digimon"))
@@ -224,6 +230,26 @@ namespace TouchToggle
 
         static string QueueDir { get { return Path.Combine(DataDir, "queue"); } }
 
+        // 助手写回的状态（ScreenPad 亮度）。所在目录只有 SYSTEM 和管理员可写，用户只读
+        static string StateFile { get { return Path.Combine(DataDir, "state.txt"); } }
+
+        // 从别处运行的新版本与已安装的后台助手不同，需要重新安装（更新）
+        public static bool NeedsUpdate()
+        {
+            if (RunningInstalled || !File.Exists(InstalledExe)) return false;
+            try
+            {
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    byte[] a, b;
+                    using (var f = File.OpenRead(Application.ExecutablePath)) a = sha.ComputeHash(f);
+                    using (var f = File.OpenRead(InstalledExe)) b = sha.ComputeHash(f);
+                    return Convert.ToBase64String(a) != Convert.ToBase64String(b);
+                }
+            }
+            catch (Exception) { return false; }
+        }
+
         public static bool SamePath(string a, string b)
         {
             return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase);
@@ -306,6 +332,50 @@ namespace TouchToggle
             }
         }
 
+        // 设置 ScreenPad 背光原始值（20-255），raw < 0 表示只查询。
+        // 返回助手读到的当前值；-1 = 没有 ScreenPad；-2 = 助手不可用或超时
+        public static int ScreenPad(int raw)
+        {
+            lock (requestLock)
+            {
+                DateTime start = DateTime.UtcNow;
+                string req = Path.Combine(QueueDir, Guid.NewGuid().ToString("N") + ".req");
+                try { File.WriteAllText(req, raw < 0 ? "Q\r\n" : "B " + raw + "\r\n", Encoding.UTF8); }
+                catch (Exception) { return -2; }
+                try
+                {
+                    string o;
+                    if (Shell.Run(Shell.Sys("schtasks.exe"), "/run /tn " + TaskName, out o) != 0) return -2;
+                    var sw = Stopwatch.StartNew();
+                    while (sw.ElapsedMilliseconds < 8000)
+                    {
+                        Thread.Sleep(80);
+                        var fi = new FileInfo(StateFile);
+                        if (!fi.Exists || fi.LastWriteTimeUtc < start) continue;
+                        int v = ReadState();
+                        if (v != -2) return v;
+                    }
+                    return -2;
+                }
+                finally
+                {
+                    try { File.Delete(req); } catch (Exception) { }
+                }
+            }
+        }
+
+        static int ReadState()
+        {
+            try
+            {
+                string t = File.ReadAllText(StateFile, Encoding.ASCII).Trim();
+                int v;
+                if (t.StartsWith("screenpad=") && int.TryParse(t.Substring(10), out v)) return v;
+            }
+            catch (Exception) { }
+            return -2;
+        }
+
         static bool IsLink(string path)
         {
             return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
@@ -339,7 +409,7 @@ namespace TouchToggle
                 string xml =
                     "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n" +
                     "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n" +
-                    "  <RegistrationInfo><Description>TouchToggle 后台助手：按托盘程序的请求启用/禁用触摸设备</Description>" +
+                    "  <RegistrationInfo><Description>TouchToggle 后台助手：按托盘程序的请求启用/禁用触摸设备、调节 ScreenPad 亮度</Description>" +
                     "<SecurityDescriptor>D:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;GRGX;;;" + sid.Value + ")</SecurityDescriptor></RegistrationInfo>\n" +
                     "  <Principals><Principal id=\"Author\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\n" +
                     "  <Settings><MultipleInstancesPolicy>Queue</MultipleInstancesPolicy><AllowStartOnDemand>true</AllowStartOnDemand>" +
@@ -409,12 +479,16 @@ namespace TouchToggle
         }
 
         // 由计划任务以 SYSTEM 身份启动：执行队列中的请求。对队列只读；只接受当前枚举到的触摸类设备；
-        // 忽略两分钟前的旧请求（托盘程序异常退出时可能残留）。
+        // 忽略两分钟前的旧请求（托盘程序异常退出时可能残留）。请求格式（每行一条）：
+        //   1 <设备实例ID> / 0 <设备实例ID>   启用 / 禁用触摸设备
+        //   B <20-255>                        设置 ScreenPad 背光
+        //   Q                                 只查询 ScreenPad 背光
+        // 处理完后把 ScreenPad 背光写入 state.txt（管理员所有的目录）。
         public static int Serve()
         {
             string dir = QueueDir;
             if (!Directory.Exists(dir) || IsLink(dir) || IsLink(DataDir)) return 0;
-            List<TouchDevice> devices = Devices.Load();
+            List<TouchDevice> devices = null;
             var files = new List<FileInfo>(new DirectoryInfo(dir).GetFiles("*.req"));
             files.Sort((a, b) => a.LastWriteTimeUtc.CompareTo(b.LastWriteTimeUtc));
             foreach (var f in files)
@@ -425,14 +499,32 @@ namespace TouchToggle
                     if (DateTime.UtcNow - f.LastWriteTimeUtc > TimeSpan.FromMinutes(2)) continue;
                     foreach (string line in File.ReadAllLines(f.FullName, Encoding.UTF8))
                     {
+                        int raw;
+                        if (line.StartsWith("B ") && int.TryParse(line.Substring(2).Trim(), out raw))
+                        {
+                            try { Atk.SetScreenPad(raw); } catch (Exception) { }
+                            continue;
+                        }
                         if (line.Length < 3 || (line[0] != '0' && line[0] != '1') || line[1] != ' ') continue;
                         string id = line.Substring(2).Trim();
+                        if (devices == null) devices = Devices.Load();
                         TouchDevice d = devices.Find(x => string.Equals(x.InstanceId, id, StringComparison.OrdinalIgnoreCase));
                         if (d != null && d.Enabled != (line[0] == '1')) Devices.SetEnabled(d, line[0] == '1');
                     }
                 }
                 catch (Exception) { }
             }
+
+            try
+            {
+                int sp = -1;
+                try { sp = Atk.GetScreenPad(); } catch (Exception) { }
+                string tmp = Path.Combine(DataDir, "state.tmp");
+                File.WriteAllText(tmp, "screenpad=" + sp, Encoding.ASCII);
+                if (File.Exists(StateFile)) File.Replace(tmp, StateFile, null);
+                else File.Move(tmp, StateFile);
+            }
+            catch (Exception) { }
             return 0;
         }
     }
@@ -462,6 +554,270 @@ namespace TouchToggle
                 }
             }
             catch (Exception) { return on ? "开启开机自启动失败" : "关闭开机自启动失败"; }
+        }
+    }
+
+    enum BrightnessKind { Wmi, Ddc, ScreenPad }
+
+    class Display
+    {
+        public string Key, Name, Detail;
+        public BrightnessKind Kind;
+        public int Value = -1;          // 0-100，界面上显示的值
+        public string WmiInstance;      // Wmi
+        public string DeviceName;       // Ddc：\\.\DISPLAY2
+        public int PhysicalIndex;       // Ddc：同一个 HMONITOR 下的第几个物理显示器
+        public uint DdcMin, DdcMax;
+
+        // 以下由 lock(this) 保护：界面线程写 Pending，后台线程把它应用到硬件
+        public int Pending, Applied;
+        public bool Applying;
+    }
+
+    // 屏幕亮度，参考 Monitorian：
+    //   笔记本内置屏 → WMI (WmiMonitorBrightness)，普通权限即可
+    //   外接显示器   → DDC/CI (dxva2)，普通权限即可
+    //   华硕 ScreenPad → ASUS ATK ACPI WMI，需要管理员，由后台助手代为执行
+    static class Brightness
+    {
+        // ScreenPad 背光原始值范围。低于 20 时背光实际已不可见（与 Linux asus-wmi 驱动一致）
+        public const int ScreenPadMin = 20, ScreenPadMax = 255;
+
+        public static int FromScreenPadRaw(int raw)
+        {
+            return Math.Max(0, Math.Min(100, (int)Math.Round((raw - ScreenPadMin) * 100.0 / (ScreenPadMax - ScreenPadMin))));
+        }
+
+        public static int ToScreenPadRaw(int value)
+        {
+            return ScreenPadMin + (int)Math.Round(value * (ScreenPadMax - ScreenPadMin) / 100.0);
+        }
+
+        // screenPadRaw：后台助手读到的 ScreenPad 背光值，-1 表示没有 ScreenPad 或未知
+        public static List<Display> Load(int screenPadRaw)
+        {
+            var wmi = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                using (var s = new ManagementObjectSearcher(@"root\wmi", "SELECT InstanceName, CurrentBrightness FROM WmiMonitorBrightness"))
+                    foreach (ManagementObject mo in s.Get())
+                        wmi[(string)mo["InstanceName"]] = Convert.ToInt32(mo["CurrentBrightness"]);
+            }
+            catch (Exception) { }   // 没有支持亮度的屏幕时 WMI 会报“不支持”
+
+            var names = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                using (var s = new ManagementObjectSearcher(@"root\wmi", "SELECT InstanceName, UserFriendlyName FROM WmiMonitorID"))
+                    foreach (ManagementObject mo in s.Get())
+                    {
+                        var chars = mo["UserFriendlyName"] as ushort[];
+                        if (chars == null) continue;
+                        var sb = new StringBuilder();
+                        foreach (ushort c in chars) if (c != 0) sb.Append((char)c);
+                        if (sb.Length > 0) names[(string)mo["InstanceName"]] = sb.ToString();
+                    }
+            }
+            catch (Exception) { }
+
+            var screens = new List<Screen>(Screen.AllScreens);
+            screens.Sort((a, b) => a.Primary != b.Primary ? (a.Primary ? -1 : 1)
+                                 : a.Bounds.Y != b.Bounds.Y ? a.Bounds.Y.CompareTo(b.Bounds.Y) : a.Bounds.X.CompareTo(b.Bounds.X));
+
+            var list = new List<Display>();
+            var rest = new List<KeyValuePair<Screen, string>>();   // 不支持 WMI 亮度的屏幕及其 WMI 实例名
+            foreach (Screen sc in screens)
+            {
+                foreach (string path in Devices.MonitorPaths(sc.DeviceName))
+                {
+                    string inst = ToWmiInstance(path);
+                    int v;
+                    if (inst != null && wmi.TryGetValue(inst, out v))
+                        list.Add(new Display
+                        {
+                            Key = "wmi:" + inst, Kind = BrightnessKind.Wmi, WmiInstance = inst, Value = v,
+                            Name = sc.Primary ? "主屏幕" : NameOf(inst, names),
+                            Detail = Res(sc) + " · 系统",
+                        });
+                    else rest.Add(new KeyValuePair<Screen, string>(sc, inst));
+                }
+            }
+
+            // DDC/CI：外接显示器
+            var noDdc = new List<KeyValuePair<Screen, string>>(rest);
+            if (rest.Count > 0)
+            {
+                ForEachPhysical((dev, index, h) =>
+                {
+                    var hit = rest.Find(p => string.Equals(p.Key.DeviceName, dev, StringComparison.OrdinalIgnoreCase));
+                    if (hit.Key == null) return;
+                    uint min, cur, max;
+                    if (!GetMonitorBrightness(h, out min, out cur, out max) || max <= min) return;
+                    noDdc.RemoveAll(p => p.Key == hit.Key);
+                    list.Add(new Display
+                    {
+                        Key = "ddc:" + dev + "#" + index, Kind = BrightnessKind.Ddc, DeviceName = dev, PhysicalIndex = index,
+                        DdcMin = min, DdcMax = max, Value = (int)Math.Round((cur - min) * 100.0 / (max - min)),
+                        Name = hit.Key.Primary ? "主屏幕" : NameOf(hit.Value, names),
+                        Detail = Res(hit.Key) + " · DDC/CI",
+                    });
+                });
+            }
+
+            // ScreenPad：剩下的屏幕中优先选超宽的那块（ScreenPad Plus 为 1920×515）
+            if (screenPadRaw >= 0 && noDdc.Count > 0)
+            {
+                noDdc.Sort((a, b) => Ratio(b.Key).CompareTo(Ratio(a.Key)));
+                var sp = noDdc[0];
+                if (noDdc.Count == 1 || Ratio(sp.Key) >= 3)
+                    list.Add(new Display
+                    {
+                        Key = "screenpad", Kind = BrightnessKind.ScreenPad, Value = FromScreenPadRaw(screenPadRaw),
+                        Name = "ScreenPad 副屏", Detail = Res(sp.Key) + " · 华硕",
+                    });
+            }
+
+            foreach (var d in list) { d.Pending = d.Value; d.Applied = d.Value; }
+            return list;
+        }
+
+        // 返回是否成功；在后台线程调用
+        public static bool Set(Display d, int value)
+        {
+            value = Math.Max(0, Math.Min(100, value));
+            switch (d.Kind)
+            {
+                case BrightnessKind.Wmi:
+                    using (var s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM WmiMonitorBrightnessMethods"))
+                        foreach (ManagementObject mo in s.Get())
+                            if (string.Equals((string)mo["InstanceName"], d.WmiInstance, StringComparison.OrdinalIgnoreCase))
+                            {
+                                mo.InvokeMethod("WmiSetBrightness", new object[] { (uint)1, (byte)value });
+                                return true;
+                            }
+                    return false;
+
+                case BrightnessKind.Ddc:
+                    bool ok = false;
+                    ForEachPhysical((dev, index, h) =>
+                    {
+                        if (index == d.PhysicalIndex && string.Equals(dev, d.DeviceName, StringComparison.OrdinalIgnoreCase))
+                            ok = SetMonitorBrightness(h, (uint)(d.DdcMin + Math.Round((d.DdcMax - d.DdcMin) * value / 100.0)));
+                    });
+                    return ok;
+
+                default:
+                    return Helper.ScreenPad(ToScreenPadRaw(value)) >= 0;
+            }
+        }
+
+        // \\?\DISPLAY#AUOA48F#4&33fd3a7c&0&UID8388688#{guid} → DISPLAY\AUOA48F\4&33fd3a7c&0&UID8388688_0
+        static string ToWmiInstance(string path)
+        {
+            int start = path.IndexOf(@"\\?\", StringComparison.Ordinal);
+            int end = path.LastIndexOf("#{", StringComparison.Ordinal);
+            if (start < 0 || end <= start) return null;
+            return path.Substring(start + 4, end - start - 4).Replace('#', '\\') + "_0";
+        }
+
+        static string NameOf(string inst, Dictionary<string, string> names)
+        {
+            string n;
+            return inst != null && names.TryGetValue(inst, out n) ? n : "显示器";
+        }
+
+        static string Res(Screen sc) { return sc.Bounds.Width + "×" + sc.Bounds.Height; }
+
+        static double Ratio(Screen sc) { return (double)sc.Bounds.Width / Math.Max(1, sc.Bounds.Height); }
+
+        // ---- DDC/CI ----
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct PHYSICAL_MONITOR
+        {
+            public IntPtr Handle;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string Description;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct MONITORINFOEX
+        {
+            public int cbSize;
+            public RECT rcMonitor, rcWork;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szDevice;
+        }
+
+        delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdc, IntPtr rect, IntPtr data);
+
+        [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc proc, IntPtr data);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX info);
+        [DllImport("dxva2.dll")] static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, out uint count);
+        [DllImport("dxva2.dll")] static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, uint count, [Out] PHYSICAL_MONITOR[] monitors);
+        [DllImport("dxva2.dll")] static extern bool DestroyPhysicalMonitors(uint count, PHYSICAL_MONITOR[] monitors);
+        [DllImport("dxva2.dll")] static extern bool GetMonitorBrightness(IntPtr h, out uint min, out uint cur, out uint max);
+        [DllImport("dxva2.dll")] static extern bool SetMonitorBrightness(IntPtr h, uint value);
+
+        // 依次打开每个物理显示器的句柄交给 f，用完立即释放
+        static void ForEachPhysical(Action<string, int, IntPtr> f)
+        {
+            var monitors = new List<IntPtr>();
+            MonitorEnumProc proc = (h, dc, r, data) => { monitors.Add(h); return true; };
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, proc, IntPtr.Zero);
+            GC.KeepAlive(proc);
+
+            foreach (IntPtr hMon in monitors)
+            {
+                var info = new MONITORINFOEX();
+                info.cbSize = Marshal.SizeOf(info);
+                uint n;
+                if (!GetMonitorInfo(hMon, ref info) || !GetNumberOfPhysicalMonitorsFromHMONITOR(hMon, out n) || n == 0) continue;
+                var arr = new PHYSICAL_MONITOR[n];
+                if (!GetPhysicalMonitorsFromHMONITOR(hMon, n, arr)) continue;
+                try
+                {
+                    for (int i = 0; i < n; i++) f(info.szDevice, i, arr[i].Handle);
+                }
+                finally { DestroyPhysicalMonitors(n, arr); }
+            }
+        }
+    }
+
+    // 华硕 ATK ACPI WMI（需要管理员），设备号与 Linux asus-wmi 驱动一致
+    static class Atk
+    {
+        const uint ScreenPadLight = 0x00050032;
+
+        static ManagementObject Instance()
+        {
+            using (var s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM AsusAtkWmi_WMNB"))
+                foreach (ManagementObject mo in s.Get()) return mo;
+            return null;
+        }
+
+        // 返回 ScreenPad 背光原始值 0-255；没有 ScreenPad 返回 -1
+        public static int GetScreenPad()
+        {
+            var mo = Instance();
+            if (mo == null) return -1;
+            var args = mo.GetMethodParameters("DSTS");
+            args["Device_ID"] = ScreenPadLight;
+            uint status = Convert.ToUInt32(mo.InvokeMethod("DSTS", args, null)["device_status"]);
+            if ((status & 0x00010000) == 0) return -1;   // 0x10000 = 设备存在
+            return (int)(status & 0xFF);
+        }
+
+        public static void SetScreenPad(int raw)
+        {
+            var mo = Instance();
+            if (mo == null) return;
+            var args = mo.GetMethodParameters("DEVS");
+            args["Device_ID"] = ScreenPadLight;
+            args["Control_status"] = (uint)Math.Max(Brightness.ScreenPadMin, Math.Min(Brightness.ScreenPadMax, raw));
+            mo.InvokeMethod("DEVS", args, null);
         }
     }
 
@@ -558,6 +914,13 @@ namespace TouchToggle
         public bool Accent, Filled;
     }
 
+    class SliderItem : Item
+    {
+        public Display D;
+        public RectangleF Track;   // 可拖动区域
+        public bool Last;
+    }
+
     // 仿 Windows 快速设置的弹出面板，全部自绘
     class Flyout : Form
     {
@@ -568,7 +931,9 @@ namespace TouchToggle
         [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr mon, int type, out uint x, out uint y);
 
         const string GlyphTouch = "\uE7C9", GlyphPen = "\uEDC6", GlyphTouchpad = "\uEFA5", GlyphShield = "\uEA18",
-                     GlyphRefresh = "\uE72C", GlyphPower = "\uE7E8", GlyphStartup = "\uE7B5";
+                     GlyphRefresh = "\uE72C", GlyphPower = "\uE7E8", GlyphStartup = "\uE7B5",
+                     GlyphBrightness = "\uE706", GlyphLink = "\uE71B";
+        const string SettingsKey = @"Software\TouchToggle";
 
         public event Action<List<TouchDevice>> DevicesChanged;
         public event Action Installed;
@@ -579,10 +944,15 @@ namespace TouchToggle
         Font fTitle, fSub, fRow, fSmall, fSection, fGlyph, fGlyphSmall;
 
         List<TouchDevice> devices = new List<TouchDevice>();
-        bool autoStart, installed = true, installing;
+        List<Display> displays = new List<Display>();
+        int screenPadRaw = -1;
+        bool autoStart, installed = true, needsUpdate, installing, unison;
         string error;
+        SliderItem dragging;
+        readonly LinkItem unisonBtn = new LinkItem { Glyph = GlyphLink, Text = "联动" };
         readonly Dictionary<string, RowItem> rows = new Dictionary<string, RowItem>();
         readonly List<RowItem> drawRows = new List<RowItem>();
+        readonly List<SliderItem> sliders = new List<SliderItem>();
         readonly List<Item> clickables = new List<Item>();
         readonly List<KeyValuePair<RectangleF, string>> sections = new List<KeyValuePair<RectangleF, string>>();
         readonly List<RectangleF> cards = new List<RectangleF>();
@@ -590,8 +960,11 @@ namespace TouchToggle
         readonly LinkItem exitBtn = new LinkItem { Glyph = GlyphPower, Text = "退出" };
         readonly LinkItem installBtn = new LinkItem { Text = "立即安装", Filled = true };
         readonly LinkItem uninstallBtn = new LinkItem { Text = "卸载" };
-        RectangleF errorRect, installRect, footerRect;
+        RectangleF errorRect, installRect, footerRect, viewRect;
         Item hovered;
+        float scroll, scrollMax;
+        Size layoutSize;         // 布局算出的尺寸（窗口可能被系统限制得比它小，截图按它来画）
+        public bool Unbounded;   // 截图用：不限制高度，不滚动
 
         readonly System.Windows.Forms.Timer anim = new System.Windows.Forms.Timer { Interval = 15 };
         Point anchor;
@@ -610,6 +983,13 @@ namespace TouchToggle
             exitBtn.Click = () => Application.Exit();
             installBtn.Click = Install;
             uninstallBtn.Click = Uninstall;
+            unison = ReadSetting("Unison") == 1;
+            unisonBtn.Click = () =>
+            {
+                unison = !unison;
+                WriteSetting("Unison", unison ? 1 : 0);
+                LayoutItems();
+            };
             anim.Tick += (o, e) => Animate();
             ApplyTheme(null, 1);
             CreateHandle();
@@ -650,24 +1030,125 @@ namespace TouchToggle
 
         public void Reload() { Reload(true); }
 
-        // checkInstall 为 false 时跳过安装状态查询（需要启动 schtasks），用于后台定时刷新
-        public void Reload(bool checkInstall)
+        // full 为 false 时只刷新触摸设备（用于后台定时刷新托盘图标）；
+        // 为 true 时还会查询安装状态、屏幕亮度，并让后台助手读取 ScreenPad 亮度
+        public void Reload(bool full)
         {
             List<TouchDevice> list = null;
-            bool auto = autoStart, inst = installed;
+            List<Display> disp = null;
+            bool auto = autoStart, inst = installed, update = needsUpdate;
+            int sp = screenPadRaw;
             Background(() =>
             {
                 list = Devices.Load();
                 auto = AutoStart.IsEnabled();
-                if (checkInstall) inst = Helper.IsInstalled();
+                if (!full) return;
+                inst = Helper.IsInstalled();
+                update = inst && Helper.NeedsUpdate();
+                disp = Brightness.Load(sp);
             }, () =>
             {
                 if (list == null) error = "读取设备列表失败";
                 else SetDevices(list);
                 autoStart = auto;
                 installed = inst;
+                needsUpdate = update;
+                if (disp != null) MergeDisplays(disp);
+                LayoutItems();
+                if (full && installed && !needsUpdate) RefreshScreenPad();
+            });
+        }
+
+        // ScreenPad 亮度只能由后台助手读取，单独异步进行，不拖慢面板打开
+        void RefreshScreenPad()
+        {
+            int raw = -2;
+            List<Display> disp = null;
+            Background(() =>
+            {
+                raw = Helper.ScreenPad(-1);
+                if (raw != -2) disp = Brightness.Load(raw);
+            }, () =>
+            {
+                if (raw == -2) return;
+                screenPadRaw = raw;
+                MergeDisplays(disp);
                 LayoutItems();
             });
+        }
+
+        // 用新读到的列表更新显示器；正在拖动或正在写入的保留界面上的值，避免滑块跳回去
+        void MergeDisplays(List<Display> fresh)
+        {
+            var merged = new List<Display>();
+            foreach (var f in fresh)
+            {
+                var old = displays.Find(d => d.Key == f.Key);
+                if (old == null) { merged.Add(f); continue; }
+                old.Name = f.Name;
+                old.Detail = f.Detail;
+                old.DeviceName = f.DeviceName;
+                old.PhysicalIndex = f.PhysicalIndex;
+                old.DdcMin = f.DdcMin;
+                old.DdcMax = f.DdcMax;
+                lock (old)
+                {
+                    bool busy = old.Applying || (dragging != null && dragging.D == old);
+                    if (!busy) { old.Value = f.Value; old.Pending = f.Value; old.Applied = f.Value; }
+                }
+                merged.Add(old);
+            }
+            displays = merged;
+        }
+
+        // 界面上改了亮度：立即更新显示，硬件写入在后台合并进行（拖动时只写最新值）
+        void SetBrightness(Display d, int value)
+        {
+            value = Math.Max(0, Math.Min(100, value));
+            if (d.Value < 0 || value == d.Value) return;
+            d.Value = value;
+            lock (d)
+            {
+                d.Pending = value;
+                if (d.Applying) return;
+                d.Applying = true;
+            }
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                bool failed = false;
+                while (true)
+                {
+                    int target;
+                    lock (d)
+                    {
+                        if (d.Pending == d.Applied) { d.Applying = false; break; }
+                        target = d.Pending;
+                    }
+                    bool ok = false;
+                    try { ok = Brightness.Set(d, target); }
+                    catch (Exception ex) { Debug.WriteLine(ex); }
+                    if (!ok) failed = true;
+                    lock (d) d.Applied = target;
+                }
+                if (failed)
+                    Post(() =>
+                    {
+                        error = d.Kind == BrightnessKind.ScreenPad && !installed ? "调节 ScreenPad 亮度需要先安装后台助手" : d.Name + "：调节亮度失败";
+                        LayoutItems();
+                    });
+            });
+        }
+
+        // 拖动一个滑块；开启联动时其他屏幕按相同幅度一起变化
+        void ChangeBrightness(SliderItem s, int value)
+        {
+            int delta = Math.Max(0, Math.Min(100, value)) - s.D.Value;
+            if (delta == 0) return;
+            if (unison)
+                foreach (var d in displays)
+                    if (d != s.D) SetBrightness(d, d.Value + delta);
+            SetBrightness(s.D, s.D.Value + delta);
+            Invalidate();
         }
 
         // 在后台线程执行 work，再回到界面线程执行 done；异常不会让程序崩溃，程序退出后不再回调
@@ -677,16 +1158,45 @@ namespace TouchToggle
             {
                 try { work(); }
                 catch (Exception ex) { Debug.WriteLine(ex); }
-                try { if (IsHandleCreated && !IsDisposed) BeginInvoke(done); }
-                catch (InvalidOperationException) { }
+                Post(done);
             });
         }
 
+        void Post(Action a)
+        {
+            try { if (IsHandleCreated && !IsDisposed) BeginInvoke(a); }
+            catch (InvalidOperationException) { }   // 程序正在退出
+        }
+
+        static int ReadSetting(string name)
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(SettingsKey))
+                {
+                    object v = k == null ? null : k.GetValue(name);
+                    return v is int ? (int)v : 0;
+                }
+            }
+            catch (Exception) { return 0; }
+        }
+
+        static void WriteSetting(string name, int value)
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.CreateSubKey(SettingsKey)) k.SetValue(name, value, RegistryValueKind.DWord);
+            }
+            catch (Exception) { }
+        }
+
+        // 截图模式用：同步加载，不检查是否需要更新（截图程序本身总是与已安装的版本不同）
         public void LoadNow()
         {
             SetDevices(Devices.Load());
             autoStart = AutoStart.IsEnabled();
             installed = Helper.IsInstalled();
+            MergeDisplays(Brightness.Load(installed ? Helper.ScreenPad(-1) : -1));
             LayoutItems();
         }
 
@@ -797,6 +1307,10 @@ namespace TouchToggle
             clickables.Add(refreshBtn);
             y += S(52);
 
+            // 标题和底栏固定，中间内容超出屏幕高度时可滚动；中间部分的坐标直接减去滚动量
+            float viewTop = y;
+            y -= scroll;
+
             if (error != null)
             {
                 errorRect = new RectangleF(pad, y, W - 2 * pad, S(40));
@@ -804,14 +1318,47 @@ namespace TouchToggle
             }
             else errorRect = RectangleF.Empty;
 
-            if (!installed)
+            if (!installed || needsUpdate)
             {
                 installRect = new RectangleF(pad, y, W - 2 * pad, S(120));
                 installBtn.R = new RectangleF(installRect.Right - S(16) - S(104), installRect.Bottom - S(16) - S(32), S(104), S(32));
+                if (!installing) installBtn.Text = needsUpdate ? "立即更新" : "立即安装";
                 clickables.Add(installBtn);
                 y += installRect.Height + S(16);
             }
             else installRect = RectangleF.Empty;
+
+            // 亮度
+            sliders.Clear();
+            if (displays.Count > 0)
+            {
+                var sec = new RectangleF(S(20), y, W - S(40), S(22));
+                sections.Add(new KeyValuePair<RectangleF, string>(sec, "亮度"));
+                if (displays.Count > 1)
+                {
+                    unisonBtn.Accent = unison;
+                    unisonBtn.R = new RectangleF(sec.Right - S(68), sec.Y - S(4), S(72), S(28));
+                    clickables.Add(unisonBtn);
+                }
+                y += S(26);
+                float sliderH = S(70);
+                cards.Add(new RectangleF(pad, y, W - 2 * pad, displays.Count * sliderH));
+                for (int i = 0; i < displays.Count; i++)
+                {
+                    var R = new RectangleF(pad, y + i * sliderH, W - 2 * pad, sliderH);
+                    var item = new SliderItem
+                    {
+                        D = displays[i],
+                        R = R,
+                        Track = new RectangleF(R.X + S(52), R.Y + S(36), R.Width - S(52) - S(16), S(26)),
+                        Last = i == displays.Count - 1,
+                    };
+                    if (dragging != null && dragging.D == item.D) dragging = item;
+                    sliders.Add(item);
+                    clickables.Add(item);
+                }
+                y += displays.Count * sliderH + S(16);
+            }
 
             var live = new HashSet<string>();
             foreach (string kind in Devices.KindOrder)
@@ -893,7 +1440,7 @@ namespace TouchToggle
                 helper.NoToggle = true;
                 Settle(helper);
                 helper.Title = "后台助手";
-                helper.Detail = "已安装 · 开关设备无需管理员";
+                helper.Detail = needsUpdate ? "需要更新" : "已安装 · 无需管理员";
                 helper.Glyph = GlyphShield;
                 helper.Last = true;
                 helper.R = new RectangleF(setCard.X, y + rowH, setCard.Width, rowH);
@@ -903,16 +1450,25 @@ namespace TouchToggle
             }
             y += setCard.Height + S(18);
 
-            footerRect = new RectangleF(0, y, W, S(56));
-            exitBtn.R = new RectangleF(W - S(16) - S(84), y + S(12), S(84), S(32));
+            float footerH = S(56);
+            float full = y + scroll + footerH;
+            float maxH = Unbounded ? float.MaxValue : Screen.FromPoint(anchor).WorkingArea.Height - 2 * S(12);
+            float height = Math.Min(full, maxH);
+            scrollMax = Math.Max(0, full - height);
+            if (scroll > scrollMax) { scroll = scrollMax; LayoutItems(); return; }
+
+            viewRect = new RectangleF(0, viewTop, W, height - footerH - viewTop);
+            footerRect = new RectangleF(0, height - footerH, W, footerH);
+            exitBtn.R = new RectangleF(W - S(16) - S(84), footerRect.Y + S(12), S(84), S(32));
             clickables.Add(exitBtn);
-            y += footerRect.Height;
+            y = height;
 
             foreach (var k in new List<string>(rows.Keys))
                 if (!live.Contains(k)) rows.Remove(k);
             if (hovered != null && !clickables.Contains(hovered)) hovered = null;
 
             var size = new Size((int)Math.Ceiling(W), (int)Math.Ceiling(y));
+            layoutSize = size;
             if (Size != size)
             {
                 Size = size;
@@ -937,10 +1493,11 @@ namespace TouchToggle
             try { if (GetDpiForMonitor(MonitorFromPoint(cursor, 2), 0, out dx, out dy) == 0) scale = dx / 96f; }
             catch (Exception) { }   // Windows 8.1 之前没有该函数
             error = null;
+            scroll = 0;
+            anchor = cursor;
             ApplyTheme(null, scale);
             Reload();
 
-            anchor = cursor;
             slide = 14;
             Opacity = 0;
             Place();
@@ -968,6 +1525,7 @@ namespace TouchToggle
             hiddenAt = DateTime.Now;
             if (hovered != null) hovered.Hover = false;
             hovered = null;
+            dragging = null;
         }
 
         protected override void OnDeactivate(EventArgs e)
@@ -1009,10 +1567,62 @@ namespace TouchToggle
 
         // ---------- 鼠标 ----------
 
+        int SliderValueAt(SliderItem s, float x)
+        {
+            float knob = S(10);   // 滑块圆点半径：两端各留出这么多
+            float t = (x - s.Track.X - knob) / Math.Max(1, s.Track.Width - 2 * knob);
+            return (int)Math.Round(Math.Max(0, Math.Min(1, t)) * 100);
+        }
+
+        // 滚动区域外只能点到固定在标题栏、底栏上的按钮
+        Item HitTest(Point p)
+        {
+            bool inView = viewRect.Contains(p);
+            return clickables.Find(c => c.R.Contains(p) && (inView || c == refreshBtn || c == exitBtn));
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left || !viewRect.Contains(e.Location)) return;
+            var s = sliders.Find(x => x.Track.Contains(e.Location));
+            if (s == null || s.D.Value < 0) return;
+            dragging = s;
+            Capture = true;
+            ChangeBrightness(s, SliderValueAt(s, e.X));
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            // 触摸板的平滑滚动每次只有几十，累计满一格再处理
+            wheelAccum += e.Delta;
+            int steps = wheelAccum / 120;
+            wheelAccum -= steps * 120;
+            if (steps == 0) return;
+
+            // 在亮度行上：调亮度，每格 2%；其他地方：滚动面板
+            var s = viewRect.Contains(e.Location) ? sliders.Find(x => x.R.Contains(e.Location)) : null;
+            if (s != null && s.D.Value >= 0) ChangeBrightness(s, s.D.Value + steps * 2);
+            else if (scrollMax > 0)
+            {
+                scroll = Math.Max(0, Math.Min(scrollMax, scroll - steps * S(64)));
+                LayoutItems();
+                hovered = null;
+            }
+        }
+
+        int wheelAccum;
+
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            Item hit = clickables.Find(c => c.R.Contains(e.Location));
+            if (dragging != null)
+            {
+                ChangeBrightness(dragging, SliderValueAt(dragging, e.X));
+                return;
+            }
+            Item hit = HitTest(e.Location);
             if (hit == hovered) return;
             if (hovered != null) hovered.Hover = false;
             hovered = hit;
@@ -1031,7 +1641,14 @@ namespace TouchToggle
         {
             base.OnMouseUp(e);
             if (e.Button != MouseButtons.Left) return;
-            Item hit = clickables.Find(c => c.R.Contains(e.Location));
+            if (dragging != null)
+            {
+                dragging = null;
+                Capture = false;
+                Invalidate();
+                return;
+            }
+            Item hit = HitTest(e.Location);
             if (hit != null && hit.Click != null) hit.Click();
         }
 
@@ -1041,7 +1658,7 @@ namespace TouchToggle
 
         public Bitmap Snapshot()
         {
-            var bmp = new Bitmap(Width, Height);
+            var bmp = new Bitmap(layoutSize.Width, layoutSize.Height);
             using (var g = Graphics.FromImage(bmp)) Render(g);
             return bmp;
         }
@@ -1054,11 +1671,12 @@ namespace TouchToggle
             // 标题
             int on = 0, total = 0;
             foreach (var d in devices) if (d.Kind == "触摸屏") { total++; if (d.Enabled) on++; }
-            Text_(g, "触摸设备", fTitle, T.Text, new RectangleF(S(20), S(16), S(260), S(24)));
+            Text_(g, "触摸与亮度", fTitle, T.Text, new RectangleF(S(20), S(16), S(260), S(24)));
             string status = total == 0 ? "未检测到触摸屏" : on == total ? "所有触摸屏已开启" : on == 0 ? "所有触摸屏已关闭" : on + " / " + total + " 块触摸屏已开启";
             Text_(g, status, fSub, T.Sub, new RectangleF(S(20), S(40), S(260), S(20)));
             DrawLink(g, refreshBtn);
 
+            g.SetClip(viewRect);
             if (!errorRect.IsEmpty)
             {
                 Fill(g, errorRect, S(6), T.ErrBg);
@@ -1072,10 +1690,13 @@ namespace TouchToggle
                 using (var pen = new Pen(Color.FromArgb(90, T.Accent)))
                     g.DrawPath(pen, p);
                 Glyph(g, GlyphShield, fGlyph, T.Accent, new RectangleF(installRect.X + S(14), installRect.Y + S(14), S(24), S(24)));
-                Text_(g, "首次使用需安装后台助手", fRow, T.Text, new RectangleF(installRect.X + S(46), installRect.Y + S(14), installRect.Width - S(60), S(24)));
-                TextRenderer.DrawText(g, "只需授权一次管理员权限，之后开关触摸设备不再弹出提示。", fSmall,
+                Text_(g, needsUpdate ? "后台助手需要更新" : "首次使用需安装后台助手", fRow, T.Text,
+                    new RectangleF(installRect.X + S(46), installRect.Y + S(14), installRect.Width - S(60), S(24)));
+                TextRenderer.DrawText(g, needsUpdate
+                        ? "当前程序比已安装的版本新。更新需要授权一次管理员权限，请先退出旧版本。"
+                        : "只需授权一次管理员权限，之后开关触摸设备、调节 ScreenPad 亮度不再弹出提示。", fSmall,
                     Rect(new RectangleF(installRect.X + S(46), installRect.Y + S(40), installRect.Width - S(60), S(36))), T.Sub,
-                    TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+                    TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | Clip);
             }
 
             foreach (var sec in sections)
@@ -1093,11 +1714,22 @@ namespace TouchToggle
             foreach (var sec in sections)
                 if (sec.Value.StartsWith("\0")) Text_(g, sec.Value.Substring(1), fRow, T.Sub, sec.Key);
 
+            foreach (var sl in sliders) DrawSlider(g, sl);
             foreach (var r in drawRows) DrawRow(g, r);
             foreach (var c in clickables)
             {
                 var l = c as LinkItem;
                 if (l != null && l != refreshBtn && l != exitBtn) DrawLink(g, l);
+            }
+            g.ResetClip();
+
+            // 滚动条
+            if (scrollMax > 0)
+            {
+                float trackY = viewRect.Y + S(4), trackH = viewRect.Height - S(8);
+                float thumbH = Math.Max(S(24), trackH * viewRect.Height / (viewRect.Height + scrollMax));
+                float thumbY = trackY + (trackH - thumbH) * (scroll / scrollMax);
+                Fill(g, new RectangleF(layoutSize.Width - S(7), thumbY, S(3), thumbH), S(1.5f), Color.FromArgb(120, T.Sub));
             }
 
             // 底栏
@@ -1108,7 +1740,7 @@ namespace TouchToggle
             DrawLink(g, exitBtn);
 
             // 窗口描边
-            using (var p = Round(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), S(8)))
+            using (var p = Round(new RectangleF(0.5f, 0.5f, layoutSize.Width - 1.5f, layoutSize.Height - 1.5f), S(8)))
             using (var pen = new Pen(T.Border))
                 g.DrawPath(pen, p);
         }
@@ -1131,6 +1763,56 @@ namespace TouchToggle
 
             if (!r.NoToggle)
                 DrawToggle(g, new RectangleF(R.Right - S(16) - S(40), R.Y + (R.Height - S(20)) / 2, S(40), S(20)), r.Anim, r.Busy, r.Hover);
+        }
+
+        // 亮度行：图标 + 名称 · 说明 + 数值，下方是 Windows 11 风格的滑块
+        void DrawSlider(Graphics g, SliderItem s)
+        {
+            RectangleF R = s.R;
+            Display d = s.D;
+            bool active = dragging == s;
+            if (!s.Last)
+                using (var pen = new Pen(T.Divider, Math.Max(1, S(1))))
+                    g.DrawLine(pen, R.X + S(52), R.Bottom, R.Right - S(16), R.Bottom);
+
+            bool known = d.Value >= 0;
+            float t = known ? d.Value / 100f : 0;
+
+            // 图标随亮度变亮
+            var ic = new RectangleF(R.X + S(12), R.Y + S(12), S(32), S(32));
+            using (var b = new SolidBrush(Theme.Blend(T.IconOff, T.AccentSoft, 0.35f + 0.65f * t))) g.FillEllipse(b, ic);
+            Glyph(g, GlyphBrightness, fGlyph, Theme.Blend(T.Sub, T.Accent, 0.4f + 0.6f * t), ic);
+
+            float tx = R.X + S(52);
+            var valueRect = new RectangleF(R.Right - S(16) - S(44), R.Y + S(12), S(44), S(22));
+            TextRenderer.DrawText(g, known ? d.Value.ToString() : "—", fRow, Rect(valueRect), active ? T.Accent : T.Text,
+                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | Clip);
+
+            float nameW = Math.Min(TextRenderer.MeasureText(g, d.Name, fRow, Size.Empty, TextFormatFlags.NoPadding).Width,
+                                   valueRect.X - tx - S(8));
+            Text_(g, d.Name, fRow, T.Text, new RectangleF(tx, R.Y + S(12), nameW, S(22)));
+            Text_(g, d.Detail, fSmall, T.Sub, new RectangleF(tx + nameW + S(8), R.Y + S(13), valueRect.X - tx - nameW - S(16), S(22)));
+
+            // 轨道
+            float knobR = S(10);
+            float x0 = s.Track.X + knobR, x1 = s.Track.Right - knobR;
+            float cy = s.Track.Y + s.Track.Height / 2;
+            float cx = x0 + (x1 - x0) * t;
+            float th = S(4);
+            Fill(g, new RectangleF(x0, cy - th / 2, x1 - x0, th), th / 2,
+                Color.FromArgb(T.Dark ? 140 : 120, T.ToggleOff));
+            if (known && cx > x0)
+                Fill(g, new RectangleF(x0, cy - th / 2, cx - x0, th), th / 2, T.Accent);
+
+            // 圆点：外圈 + 强调色内点，悬停变大、按下变小
+            if (!known) return;
+            using (var b = new SolidBrush(T.Dark ? Theme.Rgb(69, 69, 69) : Color.White))
+                g.FillEllipse(b, cx - knobR, cy - knobR, knobR * 2, knobR * 2);
+            using (var pen = new Pen(T.Dark ? Theme.Rgb(80, 80, 80) : Theme.Rgb(218, 218, 218), Math.Max(1, S(1))))
+                g.DrawEllipse(pen, cx - knobR, cy - knobR, knobR * 2, knobR * 2);
+            float inner = active ? S(4.5f) : s.Hover ? S(7) : S(6);
+            using (var b = new SolidBrush(T.Accent))
+                g.FillEllipse(b, cx - inner, cy - inner, inner * 2, inner * 2);
         }
 
         void DrawToggle(Graphics g, RectangleF r, float t, bool busy, bool hover)
@@ -1172,7 +1854,7 @@ namespace TouchToggle
             if (l.Glyph == null)
             {
                 TextRenderer.DrawText(g, l.Text, fSmall, Rect(l.R), c,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | Clip);
                 return;
             }
             var gr = new RectangleF(l.R.X + S(8), l.R.Y, S(20), l.R.Height);
@@ -1180,17 +1862,20 @@ namespace TouchToggle
             Text_(g, l.Text, fSmall, c, new RectangleF(gr.Right + S(6), l.R.Y, l.R.Right - gr.Right - S(6), l.R.Height));
         }
 
+        // TextRenderer 走 GDI，默认不遵守 Graphics 的裁剪区域，所有文字都要带上这个标志
+        const TextFormatFlags Clip = TextFormatFlags.PreserveGraphicsClipping;
+
         static void Text_(Graphics g, string text, Font f, Color c, RectangleF r)
         {
             TextRenderer.DrawText(g, text, f, Rect(r), c,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis |
-                TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+                TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | Clip);
         }
 
         static void Glyph(Graphics g, string glyph, Font f, Color c, RectangleF r)
         {
             TextRenderer.DrawText(g, glyph, f, Rect(r), c,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | Clip);
         }
 
         static void Fill(Graphics g, RectangleF r, float radius, Color c)
@@ -1372,7 +2057,7 @@ namespace TouchToggle
             // 调试用：TouchToggle.exe --snapshot out.png [dark|light] [缩放]，把面板渲染成图片
             if (mode == "--snapshot" && args.Length >= 2)
             {
-                var f = new Flyout();
+                var f = new Flyout { Unbounded = args.Length <= 4 || args[4] != "bounded" };
                 bool? dark = args.Length > 2 ? (bool?)(args[2] == "dark") : null;
                 f.ApplyTheme(dark, args.Length > 3 ? float.Parse(args[3], System.Globalization.CultureInfo.InvariantCulture) : 1.5f);
                 f.LoadNow();
